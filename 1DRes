@@ -133,7 +133,7 @@ def load_and_process_las(file_path: str) -> pd.DataFrame | None:
 
         # 必需曲线（不包含DEPTH，已强制处理）
         # required = ['AC', 'CALI', 'CNL_MATH', 'DEN', 'GR', 'PORT', 'RT', 'RXO', 'PORF']
-        required = ['AC', 'CALI', 'CNL_MATH', 'DEN', 'GR',  'RT', 'RXO', 'PORF']
+        required = ['AC', 'CALI', 'CNL_MATH', 'DEN', 'GR',  'RT', 'RXO', 'PORF','PORW','PORT']
         available_curves = [c for c in required if c in df.columns]
 
         if 'PORF' not in df.columns:
@@ -201,7 +201,7 @@ def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def prepare_features(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-    base_features = ['AC', 'CALI', 'CNL_MATH', 'DEN', 'GR', 'PORT', 'RT', 'RXO']
+    base_features = ['AC', 'CALI', 'CNL_MATH', 'DEN', 'GR', 'PORT', 'RT', 'RXO','PORW']
     derived_features = ['LOG_RT', 'INV_RT', 'LOG_GR', 'LOG_AC', 'PHI_DEN', 'AC_DEN', 'ARCHIE_TERM','PORT_DEN','PORT_AC','PORT_RT'
                         ,'RT_DEN', 'AC_RT', 'GR_RT', 'CNL_DEN','PORT_PHI_DEN','PORT_ARCHIE']
     # base_features = ['AC', 'CALI', 'CNL_MATH', 'DEN', 'GR', 'RT', 'RXO']
@@ -234,7 +234,7 @@ def select_features_by_correlation(train_df: pd.DataFrame,
 
     if len(selected_features) == 0:
         print(f"无高相关特征（阈值={threshold}），使用除PORT外的原始特征")
-        base_features = ['AC', 'CALI', 'CNL_MATH', 'DEN', 'GR', 'RT', 'RXO']
+        base_features = ['AC', 'CALI', 'CNL_MATH', 'DEN', 'GR', 'RT', 'RXO','PORW']
         selected_features = [f for f in base_features if f in feature_columns]
 
     return selected_features, corr_df
