@@ -1,0 +1,1089 @@
+import os
+import glob
+import warnings
+from typing import Tuple
+
+import lasio
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader, Dataset
+
+# 设置警告和设备
+warnings.filterwarnings('ignore')
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'使用设备: {device}')
+
+# -------------------------- 数据集类 --------------------------
+class WellLogDataset(Dataset):
+    """测井序列数据集类（用于1D ResNet + GGA）"""
+
+    def __init__(self, features: np.ndarray, targets: np.ndarray,
+                 phys_data: dict = None):
+        """phys_data: {'rt_raw': (N,), 'den_raw': (N,), 'phi_init': (N,)} 或 None"""
+        self.features = torch.from_numpy(features).float()
+        self.targets = torch.from_numpy(targets).float()
+        self.has_phys = phys_data is not None
+        if phys_data is not None:
+            self.rt_raw = torch.from_numpy(phys_data['rt_raw']).float()
+            self.den_raw = torch.from_numpy(phys_data['den_raw']).float()
+            self.phi_init = torch.from_numpy(phys_data['phi_init']).float()
+
+    def __len__(self) -> int:
+        return len(self.features)
+
+    def __getitem__(self, idx: int) -> Tuple:
+        if self.has_phys:
+            return (self.features[idx],
+                    self.rt_raw[idx], self.den_raw[idx], self.phi_init[idx],
+                    self.targets[idx])
+        return self.features[idx], self.targets[idx]
+
+
+# -------------------------- 1D ResNet 模型 --------------------------
+class ResidualBlock1D(nn.Module):
+    """标准残差块 (kernel=3, 两层卷积), 保留向后兼容"""
+    def __init__(self, in_channels: int, out_channels: int, dropout_rate: float = 0.3):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(dropout_rate)
+
+        self.shortcut = nn.Sequential()
+        if in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm1d(out_channels)
+            )
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+class MultiScaleResidualBlock1D(nn.Module):
+    """多尺度残差块: N路并行分支 → 拼接 → 1×1融合 + 残差连接
+
+    Parameters
+    ----------
+    kernel_sizes : list[int]
+        各分支的卷积核大小, 默认 [3, 5, 7].
+        如 [5, 7, 11] 用大核抓宽特征, [3] 退化为单路标准残差.
+    """
+    def __init__(self, in_channels: int, out_channels: int, dropout_rate: float = 0.3,
+                 kernel_sizes: list = None):
+        super().__init__()
+        if kernel_sizes is None:
+            kernel_sizes = [3, 5, 7]
+        self.kernel_sizes = kernel_sizes
+        n_branches = len(kernel_sizes)
+
+        # 通道均分 (最后一路补齐余数)
+        base = out_channels // n_branches
+        ch_list = [base] * (n_branches - 1) + [out_channels - base * (n_branches - 1)]
+
+        self.branches = nn.ModuleList()
+        for k, ch in zip(kernel_sizes, ch_list):
+            self.branches.append(nn.Sequential(
+                nn.Conv1d(in_channels, ch, kernel_size=k, padding=k // 2, bias=False),
+                nn.BatchNorm1d(ch),
+                nn.ReLU(inplace=True),
+            ))
+
+        # 1×1 跨尺度融合
+        self.fuse = nn.Sequential(
+            nn.Conv1d(out_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm1d(out_channels),
+        )
+
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(dropout_rate)
+
+        # Shortcut: 1×1 conv 匹配通道
+        self.shortcut = nn.Sequential()
+        if in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm1d(out_channels)
+            )
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+        branch_outs = [branch(x) for branch in self.branches]
+        out = torch.cat(branch_outs, dim=1)  # (B, out_channels, L)
+        out = self.fuse(out)
+        out = self.dropout(out)
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+class CurveDepthInception(nn.Module):
+    """2D Inception 初始层: 跨曲线×深度联合卷积
+
+    将 (num_curves, depth) 当作2D网格, 四路并行分支的卷积核覆盖全部曲线
+    和不同深度窗口, 一次性学习"哪些曲线在相邻深度上有联合响应模式".
+
+    核尺寸:
+      - (C, 1): 当前深度点, 8条曲线间的瞬时关系 (点状特征)
+      - (C, 3): ±1 深度邻域, 捕捉薄层级的曲线组合变化
+      - (C, 5): ±2 深度邻域, 捕捉岩性过渡带
+      - (C, 7): ±3 深度邻域, 捕捉沉积旋回级曲线协变
+
+    Parameters
+    ----------
+    num_curves : int
+        输入曲线数 (如 8)
+    out_channels : int
+        输出通道数, 四分支均分
+    """
+    def __init__(self, num_curves: int, out_channels: int = 32, dropout_rate: float = 0.4):
+        super().__init__()
+        # 四分支均分通道
+        c1 = out_channels // 4
+        c3 = out_channels // 4
+        c5 = out_channels // 4
+        c7 = out_channels - c1 - c3 - c5  # 确保总和 = out_channels
+        self.num_curves = num_curves
+
+        # 分支1: kernel (C, 1) — 只看当前深度点
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(1, c1, kernel_size=(num_curves, 1), stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(c1),
+            nn.ReLU(inplace=True),
+        )
+        # 分支3: kernel (C, 3) — ±1 深度邻域
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(1, c3, kernel_size=(num_curves, 3), stride=1,
+                      padding=(0, 1), bias=False),
+            nn.BatchNorm2d(c3),
+            nn.ReLU(inplace=True),
+        )
+        # 分支5: kernel (C, 5) — ±2 深度邻域
+        self.branch5 = nn.Sequential(
+            nn.Conv2d(1, c5, kernel_size=(num_curves, 5), stride=1,
+                      padding=(0, 2), bias=False),
+            nn.BatchNorm2d(c5),
+            nn.ReLU(inplace=True),
+        )
+        # 分支7: kernel (C, 7) — ±3 深度邻域
+        self.branch7 = nn.Sequential(
+            nn.Conv2d(1, c7, kernel_size=(num_curves, 7), stride=1,
+                      padding=(0, 3), bias=False),
+            nn.BatchNorm2d(c7),
+            nn.ReLU(inplace=True),
+        )
+
+        # 1×1 跨尺度融合 + 降维
+        self.fuse = nn.Sequential(
+            nn.Conv1d(out_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate),
+        )
+
+    def forward(self, x):
+        # x: (B, C, L) → 2D: (B, 1, C, L)
+        x_2d = x.unsqueeze(1)
+
+        h1 = self.branch1(x_2d)   # (B, c1, 1, L)
+        h3 = self.branch3(x_2d)   # (B, c3, 1, L)
+        h5 = self.branch5(x_2d)   # (B, c5, 1, L)
+        h7 = self.branch7(x_2d)   # (B, c7, 1, L)
+
+        # 拼接 → (B, out_channels, 1, L) → squeeze曲线维 → (B, out_channels, L)
+        out = torch.cat([h1, h3, h5, h7], dim=1).squeeze(2)
+        out = self.fuse(out)
+        return out
+
+
+class ResNetFeatureExtractor(nn.Module):
+    """ResNet特征提取器
+
+    Parameters
+    ----------
+    num_channels : int
+        输入通道数 (测井曲线数量, 默认7)
+    dropout_rate : float
+        Dropout比例
+    use_multiscale : bool
+        True = Inception模式 (2D曲线深度初始层 + 1D多尺度残差块)
+        False = 标准模式 (Conv1d初始层 + 标准残差块, 向后兼容)
+    num_blocks : int
+        残差块数量: 2 (原版) 或 3 (更深). 通道序列自动适配.
+    """
+    def __init__(self, num_channels: int, dropout_rate: float = 0.4,
+                 use_multiscale: bool = True, num_blocks: int = 2):
+        super().__init__()
+        self.use_multiscale = use_multiscale
+
+        if use_multiscale:
+            # 2D Inception: kernel = (num_curves, 1/3/5/7) 同时跨曲线和深度
+            self.initial = CurveDepthInception(num_channels, out_channels=32,
+                                                dropout_rate=dropout_rate)
+        else:
+            # 原版1D初始层 (向后兼容)
+            self.initial = nn.Sequential(
+                nn.Conv1d(num_channels, 32, kernel_size=7, padding=3, bias=False),
+                nn.BatchNorm1d(32),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout_rate)
+            )
+
+        BlockCls = MultiScaleResidualBlock1D if use_multiscale else ResidualBlock1D
+
+        # 非对称核配置: 低层大核抓形态, 高层小核精调
+        if num_blocks == 2:
+            ch_seq = [(32, 64), (64, 32)]
+            kernel_cfgs = [[5, 7, 11], [3]]
+        elif num_blocks == 3:
+            ch_seq = [(32, 64), (64, 64), (64, 32)]
+            kernel_cfgs = [[7, 11, 15], [5, 7, 9], [3, 5]]   # 大窗口用大核
+        else:
+            raise ValueError(f'num_blocks must be 2 or 3, got {num_blocks}')
+
+        self.blocks = nn.Sequential(*[
+            BlockCls(in_ch, out_ch, dropout_rate, kernel_sizes=kc)
+            for (in_ch, out_ch), kc in zip(ch_seq, kernel_cfgs)
+        ])
+        self.out_channels = ch_seq[-1][1]  # 32
+
+    def forward(self, x):
+        x = self.initial(x)
+        x = self.blocks(x)  # (B, out_channels, L)
+        return x
+
+# class ResNetBiLSTM(nn.Module):
+#     """简化版ResNet → 均值池化 → FC（用于遗传算法快速评估）"""
+#     def __init__(self, num_channels: int, dropout_rate: float = 0.4):
+#         super().__init__()
+#         self.feature_extractor = ResNetFeatureExtractor(num_channels, dropout_rate)
+#         self.fc = nn.Sequential(
+#             nn.Linear(32, 16),
+#             nn.ReLU(),
+#             nn.Dropout(dropout_rate),
+#             nn.Linear(16, 1)
+#         )
+#
+#     def forward(self, x):
+#         x = self.feature_extractor(x)       # (B, 32, L)
+#         x = x.permute(0, 2, 1)              # (B, L, 32)
+#         x = x.mean(dim=1)                   # (B, 32)
+#         out = self.fc(x)
+#         return out.squeeze(1)
+
+
+# -------------------------- GGA 地质物理信息约束注意力 --------------------------
+class PhysicalConstraintBuilder(nn.Module):
+    """构建物理先验约束矩阵 P_archie, P_density, P_geo"""
+
+    def __init__(self, rho_ma: float = 2.68, rho_f: float = 1.0,
+                 a: float = 0.62, m: float = 2.15, n: float = 2.0):
+        super().__init__()
+        self.rho_ma = rho_ma
+        self.rho_f = rho_f
+        self.a = a
+        self.m = m
+        self.n = n
+        # 可学习的束平衡系数 α, β (α+β=1 via softmax)
+        self.alpha_logits = nn.Parameter(torch.tensor([0.0, 0.0]))
+
+    def forward(self, rt: torch.Tensor, den: torch.Tensor, phi: torch.Tensor,
+                sw: torch.Tensor = None) -> torch.Tensor:
+        """
+        Args:
+            rt: 电阻率 (B, L)
+            den: 密度 (B, L)
+            phi: 当前孔隙度估计 (B, L), 初始迭代用 PHI_DEN
+            sw: 含水饱和度 (B, L), 可选
+        Returns:
+            P_geo: 复合物理约束矩阵 (B, L, L)
+        """
+        B, L = rt.shape
+        device = rt.device
+
+        # 计算电阻率和密度的全局标准差 (用于归一化)
+        sigma_rt = torch.std(rt, dim=1, keepdim=True).clamp(min=0.1)  # (B, 1)
+        sigma_den = torch.std(den, dim=1, keepdim=True).clamp(min=0.01)  # (B, 1)
+
+        # --- P_archie: 阿尔奇约束矩阵 ---
+        # F_pred = a * φ^(-m) * S_w^(-n)
+        phi_clamped = phi.clamp(min=0.001, max=0.4)
+        if sw is None:
+            sw = torch.ones_like(phi)
+        sw_clamped = sw.clamp(min=0.01, max=1.0)
+        F_pred = self.a * (phi_clamped ** (-self.m)) * (sw_clamped ** (-self.n))  # (B, L)
+        # P_archie(i,j) = exp(-|RT_i - F_pred(j)| / σ_RT)
+        rt_expanded = rt.unsqueeze(2)  # (B, L, 1)
+        F_expanded = F_pred.unsqueeze(1)  # (B, 1, L)
+        P_archie = torch.exp(-torch.abs(rt_expanded - F_expanded)
+                             / sigma_rt.unsqueeze(2))  # (B, L, L)
+
+        # --- P_density: 密度体积模型约束矩阵 ---
+        # ρ_pred = φ·ρ_f + (1-φ)·ρ_ma
+        rho_pred = phi * self.rho_f + (1.0 - phi) * self.rho_ma  # (B, L)
+        den_expanded = den.unsqueeze(2)  # (B, L, 1)
+        rho_expanded = rho_pred.unsqueeze(1)  # (B, 1, L)
+        P_density = torch.exp(-torch.abs(den_expanded - rho_expanded)
+                              / sigma_den.unsqueeze(2))  # (B, L, L)
+
+        # --- 可学习融合: P_geo = α·P_archie + β·P_density ---
+        alpha_beta = torch.softmax(self.alpha_logits, dim=0)  # (2,)
+        alpha, beta = alpha_beta[0], alpha_beta[1]
+        P_geo = alpha * P_archie + beta * P_density  # (B, L, L)
+
+        return P_geo
+
+
+class GGAHead(nn.Module):
+    """单头物理嵌入缩放点积注意力"""
+
+    def __init__(self, d_model: int = 64, d_k: int = 64, gamma: float = 0.3):
+        super().__init__()
+        self.d_k = d_k
+        self.gamma = gamma
+        self.W_q = nn.Linear(d_model, d_k)
+        self.W_k = nn.Linear(d_model, d_k)
+        self.W_v = nn.Linear(d_model, d_k)
+
+    def forward(self, x: torch.Tensor, P_geo: torch.Tensor,
+                mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Args:
+            x: 特征序列 (B, L, d_model)
+            P_geo: 物理约束矩阵 (B, L, L)
+            mask: 可选注意力掩码 (B, L, L) 用于限制窗口
+        Returns:
+            加权特征 (B, L, d_k)
+        """
+        Q = self.W_q(x)  # (B, L, d_k)
+        K = self.W_k(x)  # (B, L, d_k)
+        V = self.W_v(x)  # (B, L, d_k)
+
+        # 缩放点积 + 物理约束
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.d_k ** 0.5)  # (B, L, L)
+        scores = scores + self.gamma * P_geo  # 物理约束嵌入
+
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+
+        attn_weights = torch.softmax(scores, dim=-1)  # (B, L, L)
+        out = torch.matmul(attn_weights, V)  # (B, L, d_k)
+        return out
+
+
+class DualHeadGating(nn.Module):
+    """双头门控融合: 突变头(短窗口+ΔP_geo) + 趋势头(长窗口+P_geo), 可学习门控融合"""
+
+    def __init__(self, d_model: int = 64, gamma: float = 0.3,
+                 short_window: int = 2, long_window: int = 9):
+        super().__init__()
+        self.short_window = short_window
+        self.long_window = long_window
+
+        self.mutation_head = GGAHead(d_model, d_model, gamma)
+        self.trend_head = GGAHead(d_model, d_model, gamma)
+        self.gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.Sigmoid()
+        )
+
+    def _window_mask(self, L: int, window: int, device: torch.device) -> torch.Tensor:
+        idx = torch.arange(L, device=device)
+        dist = torch.abs(idx.unsqueeze(1) - idx.unsqueeze(0))
+        return (dist <= window).float()
+
+    def forward(self, x: torch.Tensor, P_geo: torch.Tensor) -> torch.Tensor:
+        L = x.shape[1]
+        device = x.device
+
+        # 突变头: 短窗口 + ΔP_geo (放大物理突变处的约束)
+        short_mask = self._window_mask(L, self.short_window, device)
+        delta_P = torch.abs(P_geo - P_geo.transpose(-2, -1))
+        P_mutation = P_geo * (1.0 + delta_P)
+        h1 = self.mutation_head(x, P_mutation, mask=short_mask.unsqueeze(0))
+
+        # 趋势头: 长窗口 + P_geo (保持原始物理约束)
+        long_mask = self._window_mask(L, self.long_window, device)
+        h2 = self.trend_head(x, P_geo, mask=long_mask.unsqueeze(0))
+
+        # 门控融合: g = σ(W_g·[h1;h2] + b_g) ∈ (B, L, D)
+        h_cat = torch.cat([h1, h2], dim=-1)
+        g = self.gate(h_cat)
+        return g * h1 + (1.0 - g) * h2
+
+
+class ResNetGGA_BiLSTM(nn.Module):
+    """ResNet特征提取 → GGA双头门控注意力 → FC
+
+    Parameters
+    ----------
+    num_channels : int
+        输入测井曲线数量
+    dropout_rate : float
+    use_multiscale : bool
+        True = Inception多尺度残差块, False = 标准残差块
+    num_blocks : int
+        残差块数量 (2 或 3)
+    rho_ma, rho_f, a, m, n : float
+        物理约束参数
+    """
+
+    def __init__(self, num_channels: int, dropout_rate: float = 0.4,
+                 use_multiscale: bool = True, num_blocks: int = 2,
+                 use_gga: bool = True,
+                 rho_ma: float = 2.68, rho_f: float = 1.0,
+                 a: float = 0.62, m: float = 2.15, n: float = 2.0):
+        super().__init__()
+        self.use_gga = use_gga
+        self.feature_extractor = ResNetFeatureExtractor(
+            num_channels, dropout_rate,
+            use_multiscale=use_multiscale, num_blocks=num_blocks
+        )
+        if use_gga:
+            self.constraint_builder = PhysicalConstraintBuilder(rho_ma, rho_f, a, m, n)
+            self.gga = DualHeadGating(d_model=32, gamma=0.3, short_window=3, long_window=30)
+        self.fc = nn.Sequential(
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(16, 1)
+        )
+
+    def forward(self, x, rt_raw=None, den_raw=None, phi_init=None):
+        x = self.feature_extractor(x)       # (B, 32, L)
+        x = x.permute(0, 2, 1)              # (B, L, 32)
+
+        if self.use_gga and rt_raw is not None and den_raw is not None and phi_init is not None:
+            P_geo = self.constraint_builder(rt_raw, den_raw, phi_init)
+            x = self.gga(x, P_geo)          # (B, L, 32)
+
+        x = x.mean(dim=1)                   # (B, 32)
+        out = self.fc(x)
+        return out.squeeze(1)
+
+
+# -------------------------- 数据加载与处理 --------------------------
+def load_and_process_las(file_path: str) -> pd.DataFrame | None:
+    """加载LAS文件（支持标准LAS和空格分隔纯数据格式），标准化深度列"""
+    try:
+        # 先尝试标准LAS格式
+        try:
+            las = lasio.read(file_path)
+            df = las.df().reset_index()
+        except Exception:
+            # 非标准格式：空格分隔纯数据，首行 # 注释为列名
+            with open(file_path, 'r') as f:
+                lines = f.readlines()
+            # 找列名行（以 # 开头的注释行）
+            header_line = None
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith('#'):
+                    header_line = stripped.lstrip('#').strip()
+                    break
+            if header_line is None:
+                # 无注释头，用第一行数据推断
+                data_lines = [l for l in lines if l.strip() and not l.strip().startswith('#')]
+                if not data_lines:
+                    raise ValueError("空文件")
+                # 假设列顺序
+                df = pd.read_csv(file_path, delim_whitespace=True, comment='#', header=None)
+                df.columns = [f'COL_{i}' for i in range(df.shape[1])]
+            else:
+                cols = header_line.split()
+                df = pd.read_csv(file_path, delim_whitespace=True, comment='#', header=None, names=cols)
+
+        # 标准化深度列
+        possible_depth = ['DEPTH', 'DEPT', 'MD', 'TVD', 'DEPH', 'Depth', 'depth']
+        depth_col = None
+        for col in df.columns:
+            if col.upper() in [p.upper() for p in possible_depth]:
+                depth_col = col
+                break
+        if depth_col is None:
+            depth_col = df.columns[0]
+        df = df.rename(columns={depth_col: 'DEPTH'})
+
+        # 所有列名大写
+        df.columns = df.columns.str.upper()
+
+        # 坏值 → NaN（放在merge之前，让CNL_MATH能填补CNL的坏值）
+        df = df.replace([-999.25, -9999, -9999.0, -99999, -99999.0], np.nan)
+
+        # 同义列合并: 若两列共存，用非空值补齐主列；若只有别名，重命名
+        merge_pairs = [
+            ('CAL', 'CAL1'), ('CAL', 'CALI'),
+            ('CNL', 'CNL_MATH'),
+            ('AC', 'AC_MATH'),
+        ]
+        for primary, alias_name in merge_pairs:
+            if primary in df.columns and alias_name in df.columns:
+                df[primary] = df[primary].fillna(df[alias_name])
+                df = df.drop(columns=[alias_name])
+            elif alias_name in df.columns and primary not in df.columns:
+                df = df.rename(columns={alias_name: primary})
+
+        # 简单别名 (只重命名，目标列不存在时才映射)
+        simple_alias = {
+            'RT': 'RLLD',
+            'RD': 'RLLD', 'HLLD': 'RLLD',
+            'RS': 'RLLS', 'HLLS': 'RLLS',
+            'DT24': 'AC',
+            'CNC': 'CNL',
+            'ZDEN': 'DEN',
+        }
+        df = df.rename(columns={k: v for k, v in simple_alias.items()
+                                if k in df.columns and v not in df.columns})
+
+        # 输入曲线（不含目标PMT）
+        required = ['AC', 'CAL', 'CNL', 'DEN', 'GR', 'RLLD', 'RLLS', 'SP']
+        available = [c for c in required if c in df.columns]
+
+        if 'PMT' not in df.columns:
+            if 'MPHITA' in df.columns:
+                df = df.rename(columns={'MPHITA': 'PMT'})
+            else:
+                print(f"{file_path} 无 PMT/MPHITA 目标列，跳过")
+                return None
+
+        df = df[['DEPTH'] + available + ['PMT']]
+
+        # 范围裁切: 超出合理范围的值 → NaN (后续插值补齐)
+        for c in df.columns:
+            if c == 'DEPTH':
+                continue
+            df.loc[(df[c] < -1000) | (df[c] > 10000), c] = np.nan
+
+        # 按深度排序后, 每列独立线性插值 (测井标准做法)
+        df = df.sort_values('DEPTH')
+        curve_cols = [c for c in df.columns if c != 'DEPTH' and c != 'PMT']
+        for c in curve_cols:
+            df[c] = df[c].interpolate(method='linear', limit_direction='both')
+
+        # 计算泥质含量 Vsh: GR直方图两端频数≥2%的位置作为砂/泥基线
+        if 'GR' in df.columns:
+            gr_full = df['GR'].dropna()
+            if len(gr_full) > 100:
+                hist, bins = np.histogram(gr_full.values, bins=50)
+                centers = (bins[:-1] + bins[1:]) / 2
+                threshold = len(gr_full) * 0.02
+                gr_clean = centers[np.argmax(hist >= threshold)]
+                gr_shale = centers[len(hist) - 1 - np.argmax(hist[::-1] >= threshold)]
+                if gr_shale > gr_clean:
+                    df['VSH'] = ((df['GR'] - gr_clean) / (gr_shale - gr_clean)).clip(0, 1)
+                else:
+                    df['VSH'] = 0.0
+            else:
+                df['VSH'] = 0.0
+
+        # 剔除整列为NaN的曲线 (测井未采集, 插值无法挽救) → 直接跳过该井
+        all_nan_cols = [c for c in available if df[c].isna().all()]
+        if all_nan_cols:
+            print(f"  [跳过] {os.path.basename(file_path)}: 曲线整列为空 {all_nan_cols}")
+            return None
+
+        # 仅对目标列 PMT 做 dropna (PMT 不能插值, 是标签)
+        df = df.dropna(subset=['PMT'])
+
+        if df.empty:
+            print(f"警告: {file_path} 处理后为空")
+            return None
+        return df
+
+    except Exception as e:
+        print(f"处理 {file_path} 出错: {e}")
+        return None
+
+
+def prepare_features(df: pd.DataFrame) -> list:
+    """返回可用基础测井曲线列表（GGA物理约束替代手工衍生特征）"""
+    base_features = ['AC', 'CAL', 'CNL', 'DEN', 'GR', 'RLLD', 'RLLS', 'SP']
+    return [f for f in base_features if f in df.columns]
+
+
+def discover_wells(data_dir: str):
+    """扫描数据目录中所有 .las 文件，返回排序后的文件名列表"""
+    if not os.path.isdir(data_dir):
+        raise FileNotFoundError(f"数据目录不存在: {data_dir}")
+    pattern = os.path.join(data_dir, '*.las')
+    las_files = sorted(glob.glob(pattern))
+    if not las_files:
+        raise FileNotFoundError(f"数据目录中未找到 .las 文件: {data_dir}")
+    return [os.path.basename(f) for f in las_files]
+
+
+def split_wells(well_list, train_ratio=0.70, val_ratio=0.15, test_ratio=0.15,
+                n_test_wells=None, test_well_names=None, random_seed=42):
+    """将井名列表按井级划分为 train / val / test
+
+    Parameters
+    ----------
+    n_test_wells : int or None
+        若为整数，则随机预留恰好该数量的井做测试，其余井按比例分给训练/验证。
+        若为 None，则全部按 ratio 划分。
+    test_well_names : str or list or None
+        指定具体井名做测试（如 'Sa10' 或 ['Sa10', 'Sa102']）。
+        优先级高于 n_test_wells。指定的井必须在 well_list 中。
+    """
+    import random as _random
+    rng = _random.Random(random_seed)
+    wells = list(well_list)
+
+    # --- 优先处理: 用户指定测试井名 ---
+    if test_well_names is not None:
+        if isinstance(test_well_names, str):
+            test_well_names = [test_well_names]
+        unknown = set(test_well_names) - set(wells)
+        if unknown:
+            raise ValueError(f"指定的测试井不在合格列表中: {unknown}")
+        # 确保测试井按 wells 原始顺序 (便于复现)
+        test_wells = [w for w in wells if w in set(test_well_names)]
+        remaining = [w for w in wells if w not in set(test_well_names)]
+        rng.shuffle(remaining)
+        n_rem = len(remaining)
+        n_train = max(1, int(n_rem * train_ratio / (train_ratio + val_ratio)))
+        train_wells = remaining[:n_train]
+        val_wells = remaining[n_train:]
+        return train_wells, val_wells, test_wells
+
+    # --- n_test_wells: 随机预留 N 口 ---
+    rng.shuffle(wells)
+
+    n_total = len(wells)
+
+    if n_test_wells is not None:
+        if n_test_wells >= n_total:
+            raise ValueError(f"n_test_wells ({n_test_wells}) 必须 < 总井数 ({n_total})")
+        test_wells = wells[:n_test_wells]
+        remaining = wells[n_test_wells:]
+        n_rem = len(remaining)
+        n_train = max(1, int(n_rem * train_ratio / (train_ratio + val_ratio)))
+        train_wells = remaining[:n_train]
+        val_wells = remaining[n_train:]
+    else:
+        n_train = max(1, int(n_total * train_ratio))
+        n_val = max(1, int(n_total * val_ratio))
+        n_test = max(1, n_total - n_train - n_val)
+        train_wells = wells[:n_train]
+        val_wells = wells[n_train:n_train + n_val]
+        test_wells = wells[n_train + n_val:]
+
+    if not train_wells or not val_wells or not test_wells:
+        raise ValueError(
+            f"划分产生空集: train={len(train_wells)}, val={len(val_wells)}, "
+            f"test={len(test_wells)}。请调整比例或增加井数。"
+        )
+
+    return train_wells, val_wells, test_wells
+
+
+# # -------------------------- 遗传算法优化（已注释）--------------------------
+# # from deap import algorithms, base, creator, tools
+#
+# def create_genetic_algorithm_toolbox():
+#     creator.create("FitnessMin", base.Fitness, weights=(-1.0,))
+#     creator.create("Individual", list, fitness=creator.FitnessMin)
+#     toolbox = base.Toolbox()
+#     toolbox.register("dropout", random.uniform, 0.1, 0.5)
+#     toolbox.register("log_lr", random.uniform, -5.0, -3.0)
+#     toolbox.register("batch_size", random.choice, [16, 32, 64, 128])
+#     toolbox.register("individual", tools.initCycle, creator.Individual,
+#                      (toolbox.dropout, toolbox.log_lr, toolbox.batch_size), n=1)
+#     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+#     toolbox.register("mate", tools.cxTwoPoint)
+#     toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=0.2, indpb=0.3)
+#     toolbox.register("select", tools.selTournament, tournsize=3)
+#     return toolbox
+#
+#
+# def train_for_ga(dropout_rate, lr, batch_size, X_train, y_train,
+#                  X_val, y_val, num_channels, epochs=80):
+#     train_dataset = WellLogDataset(X_train, y_train)
+#     val_dataset = WellLogDataset(X_val, y_val)
+#     train_loader = DataLoader(train_dataset, batch_size=int(batch_size), shuffle=True)
+#     val_loader = DataLoader(val_dataset, batch_size=int(batch_size), shuffle=False)
+#     model = ResNetBiLSTM(num_channels=num_channels, dropout_rate=dropout_rate).to(device)
+#     criterion = nn.MSELoss()
+#     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
+#     best_val = float('inf')
+#     patience, counter = 15, 0
+#     for _ in range(epochs):
+#         model.train()
+#         for batch in train_loader:
+#             bx, by = batch[0].to(device), batch[1].to(device)
+#             optimizer.zero_grad()
+#             pred = model(bx)
+#             loss = criterion(pred, by)
+#             loss.backward()
+#             optimizer.step()
+#         model.eval()
+#         val_loss = 0
+#         with torch.no_grad():
+#             for batch in val_loader:
+#                 bx, by = batch[0].to(device), batch[1].to(device)
+#                 pred = model(bx)
+#                 val_loss += criterion(pred, by).item()
+#         val_loss /= len(val_loader)
+#         if val_loss < best_val:
+#             best_val = val_loss; counter = 0
+#         else:
+#             counter += 1
+#         if counter >= patience: break
+#     return best_val
+#
+#
+# def optimize_hyperparameters(X_train, y_train, X_val, y_val, num_channels):
+#     print("\n开始遗传算法优化超参数（种群10，代数10）...")
+#     toolbox = create_genetic_algorithm_toolbox()
+#     def evaluate(individual):
+#         dropout_raw, log_lr_raw, batch_raw = individual
+#         dropout = float(np.clip(dropout_raw, 0.1, 0.5))
+#         log_lr = float(np.clip(log_lr_raw, -5.0, -3.0))
+#         lr = 10 ** log_lr
+#         batch_options = [16, 32, 64, 128]
+#         batch = min(batch_options, key=lambda x: abs(x - batch_raw))
+#         val_loss = train_for_ga(dropout, lr, batch, X_train, y_train, X_val, y_val, num_channels)
+#         return val_loss,
+#     toolbox.register("evaluate", evaluate)
+#     population = toolbox.population(n=10)
+#     hall_of_fame = tools.HallOfFame(1)
+#     algorithms.eaSimple(population, toolbox, cxpb=0.7, mutpb=0.3,
+#                         ngen=10, halloffame=hall_of_fame, verbose=True)
+#     best_ind = hall_of_fame[0]
+#     best_dropout_raw, best_log_lr_raw, best_batch_raw = best_ind
+#     best_dropout = float(np.clip(best_dropout_raw, 0.1, 0.5))
+#     best_log_lr = float(np.clip(best_log_lr_raw, -5.0, -3.0))
+#     best_lr = 10 ** best_log_lr
+#     batch_options = [16, 32, 64, 128]
+#     best_batch = min(batch_options, key=lambda x: abs(x - best_batch_raw))
+#     print(f"\n最优超参: dropout={best_dropout:.3f}, lr={best_lr:.2e}, batch_size={best_batch}")
+#     return best_dropout, best_lr, best_batch
+
+
+# -------------------------- 模型训练与评估 --------------------------
+def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader,
+                criterion: nn.Module, optimizer: torch.optim.Optimizer,
+                scheduler: torch.optim.lr_scheduler._LRScheduler,
+                use_phys: bool = False, patience: int = 150, max_epochs: int = 1200) -> nn.Module:
+
+    best_val_loss = float('inf')
+    counter = 0
+
+    for epoch in range(max_epochs):
+        model.train()
+        for batch in train_loader:
+            if use_phys:
+                bx, rt, d, phi_i, by = [b.to(device) for b in batch]
+                pred = model(bx, rt, d, phi_i)
+            else:
+                bx, by = batch[0].to(device), batch[-1].to(device)
+                pred = model(bx)
+
+            optimizer.zero_grad()
+            loss = criterion(pred, by)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                if use_phys:
+                    bx, rt, d, phi_i, by = [b.to(device) for b in batch]
+                    pred = model(bx, rt, d, phi_i)
+                else:
+                    bx, by = batch[0].to(device), batch[-1].to(device)
+                    pred = model(bx)
+
+                val_loss += criterion(pred, by).item()
+
+        val_loss /= len(val_loader)
+        scheduler.step(val_loss)
+
+        if epoch % 50 == 0:
+            print(f'Epoch {epoch}: Val Loss = {val_loss:.6f}')
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), 'best_resnet1d_porf.pth')
+            counter = 0
+        else:
+            counter += 1
+
+        if counter >= patience:
+            print("早停触发")
+            break
+
+    return model
+
+
+def evaluate_model(model: nn.Module, test_loader: DataLoader,
+                   scY: StandardScaler, y_test_original: np.ndarray,
+                   test_depth: np.ndarray, use_phys: bool = False) -> Tuple[np.ndarray, pd.DataFrame]:
+
+    model.eval()
+    preds_scaled = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            if use_phys:
+                bx, rt, d, phi_i, _ = [b.to(device) for b in batch]
+                pred = model(bx, rt, d, phi_i).cpu().numpy()
+            else:
+                bx = batch[0].to(device)
+                _ = batch[-1]
+                pred = model(bx).cpu().numpy()
+            preds_scaled.extend(pred)
+
+    preds_scaled = np.array(preds_scaled)
+    preds = scY.inverse_transform(preds_scaled.reshape(-1, 1)).ravel()
+
+    results = pd.DataFrame({
+        'DEPTH': test_depth,
+        'True_PMT': y_test_original,
+        'Predicted_PMT': preds
+    })
+
+    return preds, results
+
+
+# -------------------------- 主流程 --------------------------
+def main():
+    # ======================== 配置 ========================
+    data_path = r'C:\Users\dn\Desktop\数据集'
+
+    # 井划分配置
+    TRAIN_RATIO = 0.70
+    VAL_RATIO = 0.15
+    TEST_RATIO = 0.15
+    N_TEST_WELLS = None          # 随机选 N 口井测试；None 则按比例
+    TEST_WELL_NAME = 'Sa3.las'      # 指定井名测试 (如 'Sa102')；有值时覆盖 N_TEST_WELLS
+    RANDOM_SEED = 42
+
+    # 默认超参数（替代遗传算法）
+    hp_dropout = 0.4
+    hp_lr = 5e-4
+    hp_batch = 32
+    use_gga = True           # False = 纯ResNet基线, True = +GGA物理约束
+
+    # 窗口 / 物理参数
+    window_size, half_window = 61, 30
+    RHO_MA, RHO_F = 2.68, 1.0
+
+    # =================== 井自动发现 ===================
+    all_wells = discover_wells(data_path)
+    print(f"\n数据目录共发现 {len(all_wells)} 个 .las 文件")
+
+    selected_features = ['AC', 'CAL', 'CNL', 'DEN', 'GR', 'RLLD', 'RLLS', 'SP', 'VSH']
+
+    # =================== 曲线检查（先筛合格井，再划分）===================
+    qualified = []
+    for well_file in all_wells:
+        full_path = os.path.join(data_path, well_file)
+        df = load_and_process_las(full_path)
+        if df is None:
+            continue
+        missing = [f for f in selected_features if f not in df.columns]
+        if missing:
+            print(f"  [跳过] {well_file}: 缺少曲线 {missing}")
+            continue
+        qualified.append(well_file)
+
+    if len(qualified) < 3:
+        raise RuntimeError(f"合格井不足3口 (仅{len(qualified)}口)，无法划分训练/验证/测试集")
+
+    print(f"\n合格井 ({len(qualified)}/{len(all_wells)}): {qualified}")
+    print(f"基础曲线 ({len(selected_features)}): {selected_features}")
+
+    # =================== 井级划分 ===================
+    train_wells, val_wells, test_wells = split_wells(
+        qualified,
+        train_ratio=TRAIN_RATIO,
+        val_ratio=VAL_RATIO,
+        test_ratio=TEST_RATIO,
+        n_test_wells=N_TEST_WELLS,
+        test_well_names=TEST_WELL_NAME,
+        random_seed=RANDOM_SEED,
+    )
+
+    print(f"\n训练井 ({len(train_wells)}): {train_wells}")
+    print(f"验证井 ({len(val_wells)}): {val_wells}")
+    print(f"测试井 ({len(test_wells)}): {test_wells}")
+
+    # 通用单井原始数据加载 (不做标准化, 不做滑动窗口)
+    def load_well_raw(well_file, sel_feat):
+        full_path = os.path.join(data_path, well_file)
+        df = load_and_process_las(full_path)
+        if df is None:
+            return None
+        df = df.sort_values('DEPTH').reset_index(drop=True)
+        missing = set(sel_feat) - set(df.columns)
+        if missing:
+            print(f"  {well_file} 缺少 {missing}，跳过")
+            return None
+        df = df[['DEPTH', 'PMT'] + sel_feat]
+        df = df[(df['PMT'] >= 0) & (df['PMT'] <= 45)]
+
+        rt_col = df['RLLD'].values.copy() if 'RLLD' in df.columns else np.full(len(df), 20.0)
+        den_col = df['DEN'].values.copy() if 'DEN' in df.columns else np.full(len(df), 2.5)
+
+        return {'X_raw': df[sel_feat].values.astype(np.float32),
+                'y_raw': df['PMT'].values.astype(np.float32),
+                'rt_raw': rt_col.astype(np.float32),
+                'den_raw': den_col.astype(np.float32),
+                'depth': df['DEPTH'].values.astype(np.float32)}
+
+    def make_windows(X_raw, y_raw, rt_raw, den_raw, scX, scY, half_win, win_size):
+        """全局标准化 + 滑动窗口"""
+        X_n = scX.transform(X_raw)
+        y_n = scY.transform(y_raw.reshape(-1, 1)).ravel()
+        phi_raw = (RHO_MA - den_raw) / (RHO_MA - RHO_F)
+
+        X_p = np.pad(X_n, ((half_win, half_win), (0, 0)), mode='reflect')
+        rt_p = np.pad(rt_raw, (half_win, half_win), mode='reflect')
+        dn_p = np.pad(den_raw, (half_win, half_win), mode='reflect')
+        ph_p = np.pad(phi_raw, (half_win, half_win), mode='reflect')
+
+        n = len(y_raw)
+        n_curves = X_raw.shape[1]
+        # 每条曲线拆成3通道: 原始值 + 一阶梯度(形态) + 二阶梯度(曲率)
+        n_feat = n_curves * 3
+        X_s = np.zeros((n, n_feat, win_size), dtype=np.float32)
+        rt_s = np.zeros((n, win_size), dtype=np.float32)
+        dn_s = np.zeros((n, win_size), dtype=np.float32)
+        ph_s = np.zeros((n, win_size), dtype=np.float32)
+        for i in range(n):
+            for j in range(n_curves):
+                w = X_p[i:i + win_size, j]           # 第j条曲线的61点窗口
+                X_s[i, j*3, :]   = w                 # 原始值
+                X_s[i, j*3+1, :] = np.gradient(w)    # 一阶: 上升/下降形态
+                X_s[i, j*3+2, :] = np.gradient(np.gradient(w))  # 二阶: 钟形/漏斗形
+            rt_s[i] = rt_p[i:i + win_size]
+            dn_s[i] = dn_p[i:i + win_size]
+            ph_s[i] = ph_p[i:i + win_size]
+
+        return X_s, y_n, rt_s, dn_s, ph_s
+
+    # =================== 步骤1: 加载所有井原始数据 ===================
+    raw_data = {}
+    for w in qualified:
+        d = load_well_raw(w, selected_features)
+        if d is not None:
+            raw_data[w] = d
+
+    # =================== 步骤2: 在训练井上拟合全局标准化 ===================
+    X_train_raw = np.concatenate([raw_data[w]['X_raw'] for w in train_wells], axis=0)
+    y_train_raw = np.concatenate([raw_data[w]['y_raw'] for w in train_wells], axis=0)
+
+    scX = StandardScaler().fit(X_train_raw)
+    scY = StandardScaler().fit(y_train_raw.reshape(-1, 1))
+    print(f"\n全局标准化: X mean={scX.mean_[:3]}...  std={scX.scale_[:3]}...")
+    print(f"              y mean={scY.mean_[0]:.3f}  std={scY.scale_[0]:.3f}")
+
+    # =================== 步骤3: 标准化 + 滑动窗口 ===================
+    def process_split(well_list, split_name):
+        all_X, all_y, all_rt, all_den, all_phi, all_depth, all_y_orig = [], [], [], [], [], [], []
+        for w in well_list:
+            r = raw_data[w]
+            X_s, y_n, rt_s, dn_s, ph_s = make_windows(
+                r['X_raw'], r['y_raw'], r['rt_raw'], r['den_raw'],
+                scX, scY, half_window, window_size)
+            all_X.append(X_s)
+            all_y.append(y_n)
+            all_rt.append(rt_s)
+            all_den.append(dn_s)
+            all_phi.append(ph_s)
+            all_depth.append(r['depth'])
+            all_y_orig.append(r['y_raw'])
+        return (np.concatenate(all_X), np.concatenate(all_y),
+                np.concatenate(all_rt), np.concatenate(all_den),
+                np.concatenate(all_phi), np.concatenate(all_depth),
+                np.concatenate(all_y_orig))
+
+    X_train_all, y_train_all, rt_train_all, den_train_all, phi_train_all, _, _ = \
+        process_split(train_wells, 'train')
+    X_val_all, y_val_all, rt_val_all, den_val_all, phi_val_all, _, _ = \
+        process_split(val_wells, 'val')
+    X_test_all, _, rt_test_all, den_test_all, phi_test_all, test_depth_all, y_test_original_all = \
+        process_split(test_wells, 'test')
+
+    print(f"样本: 训练 {len(y_train_all)} | 验证 {len(y_val_all)} | 测试 {len(y_test_original_all)}")
+
+    num_channels = len(selected_features) * 3   # 每条曲线 → 原始+梯度+二阶梯度
+
+    # # 遗传算法优化超参数（已注释）
+    # best_dropout, best_lr, best_batch = optimize_hyperparameters(
+    #     X_train_all, y_train_all, X_val_all, y_val_all, num_channels
+    # )
+    # hp_dropout, hp_lr, hp_batch = best_dropout, best_lr, best_batch
+
+    print(f"\n使用默认超参数: dropout={hp_dropout}, lr={hp_lr}, batch_size={hp_batch}")
+
+    # 数据加载器（井级划分: train/val/test 各自独立井）
+    train_phys = {'rt_raw': rt_train_all, 'den_raw': den_train_all, 'phi_init': phi_train_all}
+    val_phys = {'rt_raw': rt_val_all, 'den_raw': den_val_all, 'phi_init': phi_val_all}
+    test_phys = {'rt_raw': rt_test_all, 'den_raw': den_test_all, 'phi_init': phi_test_all}
+
+    phys_train = train_phys if use_gga else None
+    phys_val = val_phys if use_gga else None
+    phys_test = test_phys if use_gga else None
+    train_dataset = WellLogDataset(X_train_all, y_train_all, phys_train)
+    val_dataset = WellLogDataset(X_val_all, y_val_all, phys_val)
+    test_dataset = WellLogDataset(X_test_all, np.zeros(len(y_test_original_all)), phys_test)
+
+    train_loader = DataLoader(train_dataset, batch_size=hp_batch, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=hp_batch, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=hp_batch, shuffle=False)
+
+    # 初始化模型 (Inception多尺度残差块)
+    model = ResNetGGA_BiLSTM(num_channels=num_channels, dropout_rate=hp_dropout,
+                             use_multiscale=True, num_blocks=3,
+                             use_gga=use_gga).to(device)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=hp_lr, weight_decay=1e-4)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+
+    # 训练（ResNet → GGA → FC）
+    model = train_model(model, train_loader, val_loader, criterion, optimizer, scheduler,
+                        use_phys=use_gga, patience=150, max_epochs=1200)
+
+    # 加载最佳模型并评估
+    model.load_state_dict(torch.load('best_resnet1d_porf.pth'))
+    preds, results = evaluate_model(model, test_loader, scY, y_test_original_all,
+                                    test_depth_all, use_phys=use_gga)
+
+    # 保存结果
+    results.to_excel('PMT_Prediction_Results_1DResNet.xlsx', index=False)
+    print("\n预测结果已保存至 PMT_Prediction_Results_1DResNet.xlsx")
+
+    # 评估指标
+    mse = mean_squared_error(y_test_original_all, preds)
+    mae = mean_absolute_error(y_test_original_all, preds)
+    r2 = r2_score(y_test_original_all, preds)
+
+    test_names = ', '.join(test_wells)
+    print(f"\n测试集评估 ({test_names}):")
+    print(f"  MSE = {mse:.6f}")
+    print(f"  MAE = {mae:.6f}")
+    print(f"  R²  = {r2:.6f}")
+
+
+if __name__ == "__main__":
+    main()
